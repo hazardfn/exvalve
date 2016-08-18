@@ -202,7 +202,63 @@ defmodule Exvalve.Server do
     {:reply, :ok, %{s | queues: newqueues, queue_pids: newqpids}}
   end
 
-  def handle_cast({:init, queues, pushback, worker_count, event_handlers}, _s) do
+  def handle_call(:get_workers, _from, %Exvalve.Server{ available_workers: workers } = s) do
+    Logger.info("List of workers requested: #{inspect workers}")
+    {:reply, workers, s}
+  end
+  def handle_call({:assign_work, {work, timestamp}, {key, qpid, backend}}, _from, %Exvalve.Server{available_workers: workers} = s) do
+    case workers == [] do
+      false ->
+        [worker | t] = workers
+        exvalve = self()
+        workfun = fn() -> Exvalve.notify(exvalve, {:result, work.(), key}) end
+        Exvalve.notify(exvalve, {:worker_assigned, key, worker, t})
+        Exvalve.Worker.do_work(worker, {:work, workfun})
+        {:noreply, %{s | available_workers: t}}
+      true ->
+        Exvalve.notify(self(), {:work_requeued, key, []})
+        Exvalve.Queue.push_r(backend, qpid, {work, timestamp})
+        {:noreply, s}
+    end
+  end
+  def handle_call({:remove, key}, _from, %Exvalve.Server{ queues: queues,
+                                                          queue_pids: qpids
+                                                        } = s) do
+    Supervisor.terminate_child(Exvalve.Queue.Supervisor, key)
+    Supervisor.delete_child(Exvalve.Queue.Supervisor, key)
+    {:reply, :ok, %{s | queues: :lists.keydelete(key, 1, queues),
+                    queue_pids: :lists.keydelete(key,1, qpids)}}
+  end
+  def handle_call({:add_handler, module, args}, _from, %Exvalve.Server{event_server: event_server} = s) do
+    Logger.info("Handler added, Module: #{inspect module}, Args: #{inspect args}")
+    :ok = GenEvent.add_handler(event_server, module, args)
+    {:reply, :ok, s}
+  end
+  def handle_call({:remove_handler, module, args}, _from, %Exvalve.Server{event_server: event_server} = s) do
+    Logger.info("Handler removed, Module: #{inspect module}, Args: #{inspect args}")
+    :ok = GenEvent.remove_handler(event_server, module, args)
+    {:reply, :ok, s}
+  end
+  def handle_call({:update, key, { key,
+                                   _,
+                                   _,
+                                   _,
+                                   _,
+                                   _,
+                                   backend} = q}, _from, %Exvalve.Server{ queues: queues,
+                                                                          queue_pids: qpids
+                                                                        } = s) do
+    Logger.info("Queue options updated, Key: #{inspect key}, Update: #{inspect q}")
+    nuqs = :lists.append(:lists.keydelete(key, 1, queues), [q])
+    nuqpids = :lists.append(:lists.keydelete(key, 1, qpids), [{key, backend}])
+    {:reply, :ok, %{s | queues: nuqs,
+                    queue_pids: nuqpids}}
+  end
+  def handle_call(:get_queues, _from, %Exvalve.Server{queues: queues} = s) do
+    {:reply, queues, s}
+  end
+
+  def handle_cast({:init, queues, pushback, worker_count, event_handlers}, s) do
     {:ok, event_server} = GenEvent.start_link()
     event_handlers |>
       Enum.each(fn({event_module, args}) -> GenEvent.add_handler(event_server, event_module, args) end)
@@ -212,13 +268,36 @@ defmodule Exvalve.Server do
       [{key, backend}]
     end)
     workers = do_start_workers(worker_count)
-    {:noreply, %Exvalve.Server{ :queues => queues,
-                                :queue_pids => qpids,
-                                :pushback => pushback,
-                                :workers => workers,
-                                :event_server => event_server,
-                                :available_workers => workers
+    {:noreply, %Exvalve.Server{ s | queues: queues,
+                                queue_pids: qpids,
+                                pushback: pushback,
+                                workers: workers,
+                                event_server: event_server,
+                                available_workers: workers
                               }}
+  end
+  def handle_cast({:pushback, key}, %Exvalve.Server{queues: queues} = s) do
+    case :lists.keyfind(key, 1, queues) do
+      {^key, _, _, {:pushback, pushback, :seconds}, _, _, _} = q ->
+        exvalve = self()
+        :erlang.spawn(fn() ->
+          timeoutms = :timer.seconds(pushback)
+          :timer.sleep(timeoutms)
+          notify(exvalve, {:threshold_hit, q})
+        end)
+        {:noreply, s}
+      false ->
+        {:noreply, s}
+    end
+  end
+  def handle_cast({:notify, event}, %Exvalve.Server{ event_server: event_server} = s) do
+    GenEvent.notify(event_server, event)
+    {:noreply, s}
+  end
+
+  def terminate(_reason, %Exvalve.Server{ workers: workers, event_server: event_server} = _s) do
+    workers |> Enum.each(fn(worker) -> Exvalve.Worker.stop(worker) end)
+    GenEvent.stop(event_server)
   end
   ##==============================================================================
   ## Private
@@ -229,7 +308,6 @@ defmodule Exvalve.Server do
   end
 
   defp do_add(exvalve, q, option, :skip_get) do
-    Logger.info("Running GenServer call {:add, #{inspect q}, #{option}} - do_get_queue was skipped")
     GenServer.call(exvalve, {:add, q, option})
   end
 

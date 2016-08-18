@@ -5,6 +5,7 @@
 ################################################################################
 defmodule Exvalve.Queue.Supervisor do
   use Supervisor
+  require Logger
   import Supervisor.Spec
 
   ##==============================================================================
@@ -35,14 +36,7 @@ defmodule Exvalve.Queue.Supervisor do
     supervise([], strategy: :one_for_one, max_restarts: 3, max_seconds: 60)
   end
 
-  defp exvalve_queue_child_specs([backend, key, q]) do
-    [worker(key,
-        [backend, :exvalve, q],
-        id: key,
-        function: Exvalve.Queue.start_link(backend, :exvalve, q),
-        restart: :permanent,
-        shutdown: 3600,
-        modules: [backend]
-      )]
+  def exvalve_queue_child_specs([backend, key, q]) do
+    worker(Exvalve.Queue, [backend, :exvalve, q], [id: key])
   end
 end

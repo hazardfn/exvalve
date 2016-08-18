@@ -5,6 +5,7 @@
 ################################################################################
 defmodule Exvalve.Queue.Backend.Fifo do
   @behaviour Exvalve.Queue
+  require Logger
   use GenServer
 
   @moduledoc """
@@ -27,8 +28,7 @@ defmodule Exvalve.Queue.Backend.Fifo do
     non_neg_integer(),
     non_neg_integer()) :: :ok
   def consume(exvalve, qpid, backend, key, timeout, poll_count) do
-    #do_consume(exvalve, qpid, backend, key, timeout, poll_count)
-    :lol
+    do_consume(exvalve, qpid, backend, key, timeout, poll_count)
   end
 
   @doc """
@@ -179,7 +179,7 @@ defmodule Exvalve.Queue.Backend.Fifo do
                        {:poll_count, poll_count},
                        backend
                       } = q]) do
-    #Exvalve.notify(exvalve, {:queue_started, q})
+    Exvalve.notify(exvalve, {:queue_started, q})
     {:ok, %Exvalve.Queue{:key => key,
                          :threshold => threshold,
                          :timeout => timeout,
@@ -190,5 +190,201 @@ defmodule Exvalve.Queue.Backend.Fifo do
                          :q => q,
                          :exvalve => exvalve
                         }}
+  end
+
+  def handle_call(:pop, _from, %Exvalve.Queue{ queue: q,
+                                               q: rawq,
+                                               size: size,
+                                               tombstoned: tombstone,
+                                               exvalve: exvalve } = s) do
+    value = :queue.out(q)
+    evaluate_value(exvalve, tombstone, size, rawq, value, :queue_popped, s)
+  end
+  def handle_call(:pop_r, _from, %Exvalve.Queue{ queue: q,
+                                                 q: rawq,
+                                                 size: size,
+                                                 tombstoned: tombstone,
+                                                 exvalve: exvalve } = s) do
+    value = :queue.out_r(q)
+    evaluate_value(exvalve, tombstone, size, rawq, value, :queue_popped_r, s)
+  end
+  def handle_call(:is_consuming, _from, %Exvalve.Queue{ consuming: consuming} = s) do
+    {:reply, consuming, s}
+  end
+  def handle_call(:is_locked, _from, %Exvalve.Queue{locked: locked} = s) do
+    {:reply, locked, s}
+  end
+  def handle_call(:is_tombstoned, _from, %Exvalve.Queue{tombstoned: tombstoned} = s) do
+    {:reply, tombstoned, s}
+  end
+  def handle_call(:size, _from, %Exvalve.Queue{size: size} = s) do
+    {:reply, size, s}
+  end
+  def handle_call(:get_state, _from, s) do
+    {:reply, s, s}
+  end
+
+  def handle_cast({:push, {work, _timestamp} = value}, %Exvalve.Queue{ exvalve: exvalve,
+                                                                       q: rawq,
+                                                                       queue: q} = s) do
+    Exvalve.notify(exvalve, {:queue_push, rawq})
+    evaluate_push(s, :queue.in(value, q), work)
+  end
+  def handle_cast({:push_r, {work, _timestamp} = value}, %Exvalve.Queue{ exvalve: exvalve,
+                                                                         q: rawq,
+                                                                         queue: q} = s) do
+    Exvalve.notify(exvalve, {:queue_push_r, rawq})
+    evaluate_push(s, :queue.in_r(value, q), work)
+  end
+  def handle_cast(:lock, %Exvalve.Queue{ exvalve: exvalve,
+                                         q: rawq} = s) do
+    Exvalve.notify(exvalve, {:queue_locked, rawq})
+    {:noreply, %{s | locked: true}}
+  end
+  def handle_cast(:unlock, %Exvalve.Queue{ exvalve: exvalve,
+                                           q: rawq} = s) do
+    Exvalve.notify(exvalve, {:queue_unlocked, rawq})
+    {:noreply, %{s | locked: false}}
+  end
+  def handle_cast(:tombstone, %Exvalve.Queue{ exvalve: exvalve,
+                                              q: rawq} = s) do
+    Exvalve.notify(exvalve, {:queue_tombstoned, rawq})
+    {:noreply, %{s | tombstoned: true}}
+  end
+  def handle_cast({:crossover, nuq}, %Exvalve.Queue{ key: key,
+                                                     exvalve: exvalve,
+                                                     q: rawq,
+                                                   } = s) do
+    Exvalve.notify(exvalve, {:queue_crossover, rawq, nuq})
+    Exvalve.update(exvalve, key, nuq)
+    do_crossover(nuq, s)
+  end
+  def handle_cast(:start_consumer, %Exvalve.Queue{ exvalve: exvalve,
+                                                   queue_pid: qpid,
+                                                   backend: backend,
+                                                   key: key,
+                                                   timeout: timeout,
+                                                   poll_rate: poll_rate,
+                                                   poll_count: poll_count,
+                                                   q: rawq,
+                                                   consumer: tref } = s) do
+    if tref == nil do
+      Logger.info("Starting consumer: #{inspect key}")
+      start_timer(exvalve, qpid, backend, key, timeout, poll_rate, rawq, s, poll_count)
+    else
+      Logger.info("Consumer already started: #{inspect key}")
+      {:noreply, s}
+    end
+  end
+  def handle_cast(:stop_consumer, %Exvalve.Queue{ consumer: tref,
+                                                  q: rawq,
+                                                  exvalve: exvalve
+                                                } = s) do
+    if tref do
+      :timer.cancel(tref)
+      Exvalve.notify(exvalve, {:queue_consumer_stopped, rawq})
+    end
+    {:noreply, %{s | consumer: nil, consuming: false}}
+  end
+
+  ##==============================================================================
+  ## Helpers
+  ##==============================================================================
+  defp do_consume(_exvalve, _qpid, _backend, _key, _timeout, -1) do
+    :ok
+  end
+  defp do_consume(exvalve, qpid, backend, key, timeout, n) do
+    queue_value = GenServer.call(qpid, :pop)
+    case queue_value do
+      {{:value, {work, timestamp}}, _q} ->
+        case is_stale(timeout, timestamp) do
+          false ->
+            GenServer.call(exvalve, {:assign_work, {work, timestamp}, {key, qpid, backend}})
+          true ->
+            Exvalve.notify(exvalve, {:timeout, key})
+        end
+      {:empty, :tombstoned} ->
+        Exvalve.notify(exvalve, {:queue_removed, key})
+        Exvalve.remove(exvalve, key, :force_remove)
+      {:empty, _} ->
+        :ok
+    end
+    do_consume(exvalve, qpid, backend, key, timeout, n-1)
+  end
+
+  defp update_state(q, size, s) do
+    %{s | size: size, queue: q}
+  end
+
+  defp evaluate_value(exvalve, tombstone, size, rawq, value, event, s) do
+    case value do
+      {{:value, {_work, _timestamp}}, q} ->
+        Exvalve.notify(exvalve, {event, rawq})
+        {:reply, value, update_state(q, size-1, s)}
+      {:empty, _} ->
+        case tombstone do
+          false -> {:reply, value, s}
+          true  -> {:reply, {:empty, :tombstoned}, s}
+        end
+    end
+  end
+
+  defp evaluate_push(%Exvalve.Queue{ key: key,
+                                     exvalve: exvalve,
+                                     q: rawq,
+                                     threshold: threshold,
+                                     size: size,
+                                     locked: locked
+                                   } = s, q, work) do
+    case locked do
+      false ->
+        case size >= threshold do
+          true ->
+            Exvalve.pushback(exvalve, key)
+            {:noreply, s}
+          false ->
+            Logger.info("Work pushed, Key: #{inspect key}, Value: #{inspect work}")
+            Exvalve.notify(exvalve, {:push_complete, rawq})
+            {:noreply, update_state(q, size+1, s)}
+        end
+      true ->
+        Logger.warn("Push to a locked queue: #{inspect key}")
+        Exvalve.notify(exvalve, {:push_to_locked_queue, key})
+        {:noreply, s}
+    end
+  end
+
+  defp do_crossover({ _key,
+                      {:threshold, threshold},
+                      {:timeout, timeout, :seconds},
+                      {:pushback, pushback, :seconds},
+                      {:poll_rate, poll_rate, :ms},
+                      {:poll_count, poll_count},
+                      _backend
+                    } = q, s) do
+    {:noreply, %{s |
+                 threshold: threshold,
+                 timeout: timeout,
+                 pushback: pushback,
+                 poll_rate: poll_rate,
+                 poll_count: poll_count,
+                 q: q}}
+  end
+
+  defp start_timer(exvalve, qpid, backend, key, timeout, poll, rawq, s, poll_count) do
+    {:ok, tref} = :timer.apply_interval(
+      poll,
+      __MODULE__,
+      :consume,
+      [exvalve, qpid, backend, key, timeout, poll_count]
+    )
+    Exvalve.notify(exvalve, {:queue_consumer_started, rawq})
+    {:noreply, %{s | consumer: tref, consuming: true}}
+  end
+
+  defp is_stale(timeout, timestamp) do
+    timeoutms = :timer.seconds(timeout)
+    diff = :timer.now_diff(:erlang.timestamp(), timestamp)
+    diff > (timeoutms * 1000)
   end
 end

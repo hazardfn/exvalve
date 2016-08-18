@@ -38,21 +38,21 @@ defmodule Exvalve.Supervisor do
   ##==============================================================================
   defp exvalve_server_child_specs() do
     [worker(Exvalve.Server,
-        [[]],
-        id: :exvalve,
-        restart: :permanent,
-        shutdown: 3600,
-        modules: [Exvalve.Server]
+      [[]],
+      id: :exvalve,
+      restart: :permanent,
+      shutdown: 3600,
+      modules: [Exvalve.Server]
       )]
   end
 
   defp exvalve_server_child_specs_with_options(options) do
     [worker(Exvalve,
-        [options],
-        id: :exvalve,
-        restart: :permanent,
-        shutdown: 3600,
-        modules: [Exvalve.Server]
-      )]
+      [options],
+      id: :exvalve,
+      restart: :permanent,
+      shutdown: 3600,
+      modules: [Exvalve.Server]
+    )]
   end
 end
