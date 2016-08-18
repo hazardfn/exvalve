@@ -1,0 +1,7 @@
+%{"cowboy": {:git, "https://github.com/ninenines/cowboy.git", "5cb2b544b7dcce296bdb956b14521fb036c26ed8", [branch: "master"]},
+  "cowlib": {:git, "https://github.com/ninenines/cowlib.git", "8cf98c9f3d1292c1b08fca5ca99772ae912eaa86", [branch: "master"]},
+  "goldrush": {:hex, :goldrush, "0.1.8", "2024ba375ceea47e27ea70e14d2c483b2d8610101b4e852ef7f89163cdb6e649", [:rebar3], []},
+  "gun": {:git, "https://github.com/ninenines/gun.git", "0414eede62946f995a5ab4879f9026548440199c", [branch: "master"]},
+  "jsx": {:hex, :jsx, "2.8.0", "749bec6d205c694ae1786d62cea6cc45a390437e24835fd16d12d74f07097727", [:mix, :rebar], []},
+  "lager": {:hex, :lager, "3.2.1", "eef4e18b39e4195d37606d9088ea05bf1b745986cf8ec84f01d332456fe88d17", [:rebar3], [{:goldrush, "0.1.8", [hex: :goldrush, optional: false]}]},
+  "ranch": {:git, "https://github.com/extend/ranch.git", "82c1aa77e64c610f6b2ac0666ae5435f5f79fa40", [branch: "master"]}}
